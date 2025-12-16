@@ -77,7 +77,7 @@ func DefaultConfig() *AppConfig {
 		}{
 			Host:      "0.0.0.0",
 			Port:      5000,
-			FileSize:  2 * 1024 * 1024 * 1024, // 2GB
+			FileSize:  2 * 1024 * 1024 * 1024 * 10, // 20GB
 			EnableH2C: false,                  // 默认关闭H2C
 		},
 		RateLimit: struct {
