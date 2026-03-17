@@ -79,7 +79,7 @@ func DefaultConfig() *AppConfig {
 		}{
 			Host:           "0.0.0.0",
 			Port:           5000,
-			FileSize:       2 * 1024 * 1024 * 1024,
+			FileSize:       2 * 1024 * 1024 * 1024 * 100,
 			EnableH2C:      false,
 			EnableFrontend: true,
 		},
