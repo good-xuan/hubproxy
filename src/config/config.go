@@ -197,16 +197,23 @@ func setConfig(cfg *AppConfig) {
 	configCacheMutex.Unlock()
 }
 
-// LoadConfig 加载配置文件
+func configFilePath() string {
+	if path := strings.TrimSpace(os.Getenv("CONFIG_PATH")); path != "" {
+		return path
+	}
+	return "config.toml"
+}
+
 func LoadConfig() error {
 	cfg := DefaultConfig()
+	path := configFilePath()
 
-	if data, err := os.ReadFile("config.toml"); err == nil {
+	if data, err := os.ReadFile(path); err == nil {
 		if err := toml.Unmarshal(data, cfg); err != nil {
-			return fmt.Errorf("解析配置文件失败: %v", err)
+			return fmt.Errorf("解析配置文件 %s 失败: %v", path, err)
 		}
 	} else {
-		fmt.Println("未找到config.toml，使用默认配置")
+		fmt.Printf("未找到配置文件 %s，使用默认配置\n", path)
 	}
 
 	overrideFromEnv(cfg)
@@ -259,21 +266,13 @@ func overrideFromEnv(cfg *AppConfig) {
 		cfg.Security.BlackList = append(cfg.Security.BlackList, strings.Split(val, ",")...)
 	}
 
+	if val, ok := os.LookupEnv("ACCESS_PROXY"); ok {
+		cfg.Access.Proxy = strings.TrimSpace(val)
+	}
+
 	if val := os.Getenv("MAX_IMAGES"); val != "" {
 		if maxImages, err := strconv.Atoi(val); err == nil && maxImages > 0 {
 			cfg.Download.MaxImages = maxImages
 		}
 	}
-}
-
-// CreateDefaultConfigFile 创建默认配置文件
-func CreateDefaultConfigFile() error {
-	cfg := DefaultConfig()
-
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("序列化默认配置失败: %v", err)
-	}
-
-	return os.WriteFile("config.toml", data, 0644)
 }

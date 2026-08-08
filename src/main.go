@@ -4,7 +4,9 @@ import (
 	"embed"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -16,126 +18,113 @@ import (
 	"hubproxy/utils"
 )
 
-//go:embed public/*
+//go:embed all:dist
 var staticFiles embed.FS
 
-// 服务嵌入的静态文件
-func serveEmbedFile(c *gin.Context, filename string) {
-	data, err := staticFiles.ReadFile(filename)
-	if err != nil {
-		c.Status(404)
-		return
-	}
-	contentType := "text/html; charset=utf-8"
-	if strings.HasSuffix(filename, ".ico") {
-		contentType = "image/x-icon"
-	}
-	c.Data(200, contentType, data)
-}
-
 var (
-	globalLimiter *utils.IPRateLimiter
-
-	// 服务启动时间
+	globalLimiter    *utils.IPRateLimiter
 	serviceStartTime = time.Now()
 )
 
 var Version = "dev"
 
+func init() {
+	for ext, typ := range map[string]string{
+		".js":    "application/javascript; charset=utf-8",
+		".mjs":   "application/javascript; charset=utf-8",
+		".woff":  "font/woff",
+		".woff2": "font/woff2",
+		".map":   "application/json",
+	} {
+		_ = mime.AddExtensionType(ext, typ)
+	}
+}
+
+func contentTypeFor(filename string) string {
+	if ct := mime.TypeByExtension(path.Ext(filename)); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+func serveEmbedFile(c *gin.Context, filename string) {
+	data, err := staticFiles.ReadFile(filename)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Data(http.StatusOK, contentTypeFor(filename), data)
+}
+
+func serveSPA(c *gin.Context) {
+	serveEmbedFile(c, "dist/index.html")
+}
+
+func registerFrontendRoutes(router *gin.Engine, enabled bool) {
+	if !enabled {
+		notFound := func(c *gin.Context) { c.Status(http.StatusNotFound) }
+		router.GET("/", notFound)
+		router.GET("/images", notFound)
+		router.GET("/search", notFound)
+		router.GET("/assets/*filepath", notFound)
+		router.GET("/favicon.ico", notFound)
+		return
+	}
+
+	router.GET("/", serveSPA)
+	router.GET("/images", serveSPA)
+	router.GET("/search", serveSPA)
+	router.GET("/favicon.ico", func(c *gin.Context) {
+		serveEmbedFile(c, "dist/favicon.ico")
+	})
+	router.GET("/assets/*filepath", func(c *gin.Context) {
+		filepath := strings.TrimPrefix(c.Param("filepath"), "/")
+		if filepath == "" || strings.Contains(filepath, "..") {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		serveEmbedFile(c, path.Join("dist/assets", filepath))
+	})
+}
+
 func buildRouter(cfg *config.AppConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
+	utils.ConfigureTrustedProxies(router)
 
-	// 全局Panic恢复保护
 	router.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
-		log.Printf("🚨 Panic recovered: %v", recovered)
+		log.Printf("Panic 已恢复: %v", recovered)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Internal server error",
 			"code":  "INTERNAL_ERROR",
 		})
 	}))
 
-	// 全局限流中间件
 	router.Use(utils.RateLimitMiddleware(globalLimiter))
 
-	// 初始化监控端点
 	initHealthRoutes(router)
-
-	// 初始化镜像tar下载路由
 	handlers.InitImageTarRoutes(router)
-
-	if cfg.Server.EnableFrontend {
-		router.GET("/", func(c *gin.Context) {
-			serveEmbedFile(c, "public/index.html")
-		})
-		router.GET("/public/*filepath", func(c *gin.Context) {
-			filepath := strings.TrimPrefix(c.Param("filepath"), "/")
-			serveEmbedFile(c, "public/"+filepath)
-		})
-
-		router.GET("/images.html", func(c *gin.Context) {
-			serveEmbedFile(c, "public/images.html")
-		})
-		router.GET("/search.html", func(c *gin.Context) {
-			serveEmbedFile(c, "public/search.html")
-		})
-		router.GET("/favicon.ico", func(c *gin.Context) {
-			serveEmbedFile(c, "public/favicon.ico")
-		})
-	} else {
-		router.GET("/", func(c *gin.Context) {
-			c.Status(http.StatusNotFound)
-		})
-		router.GET("/public/*filepath", func(c *gin.Context) {
-			c.Status(http.StatusNotFound)
-		})
-		router.GET("/images.html", func(c *gin.Context) {
-			c.Status(http.StatusNotFound)
-		})
-		router.GET("/search.html", func(c *gin.Context) {
-			c.Status(http.StatusNotFound)
-		})
-		router.GET("/favicon.ico", func(c *gin.Context) {
-			c.Status(http.StatusNotFound)
-		})
-	}
-
-	// 注册dockerhub搜索路由
+	registerFrontendRoutes(router, cfg.Server.EnableFrontend)
 	handlers.RegisterSearchRoute(router)
 
-	// 注册Docker认证路由
 	router.Any("/token", handlers.ProxyDockerAuthGin)
 	router.Any("/token/*path", handlers.ProxyDockerAuthGin)
-
-	// 注册Docker Registry代理路由
 	router.Any("/v2/*path", handlers.ProxyDockerRegistryGin)
-
-	// 注册GitHub代理路由（NoRoute处理器）
 	router.NoRoute(handlers.GitHubProxyHandler)
 
 	return router
 }
 
 func main() {
-	// 加载配置
 	if err := config.LoadConfig(); err != nil {
 		fmt.Printf("配置加载失败: %v\n", err)
 		return
 	}
 
-	// 初始化HTTP客户端
 	utils.InitHTTPClients()
-
-	// 初始化限流器
 	globalLimiter = utils.InitGlobalLimiter()
-
-	// 初始化Docker流式代理
 	handlers.InitDockerProxy()
-
-	// 初始化镜像流式下载器
 	handlers.InitImageStreamer()
-
-	// 初始化防抖器
 	handlers.InitDebouncer()
 
 	cfg := config.GetConfig()
@@ -144,16 +133,12 @@ func main() {
 	fmt.Printf("HubProxy 启动成功\n")
 	fmt.Printf("监听地址: %s:%d\n", cfg.Server.Host, cfg.Server.Port)
 	fmt.Printf("限流配置: %d请求/%g小时\n", cfg.RateLimit.RequestLimit, cfg.RateLimit.PeriodHours)
-
-	// 显示HTTP/2支持状态
 	if cfg.Server.EnableH2C {
 		fmt.Printf("H2c: 已启用\n")
 	}
-
 	fmt.Printf("版本号: %s\n", Version)
 	fmt.Printf("项目地址: https://github.com/sky22333/hubproxy\n")
 
-	// 创建HTTP2服务器
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 		ReadTimeout:  60 * time.Second,
@@ -161,39 +146,37 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// 根据配置决定是否启用H2C
 	if cfg.Server.EnableH2C {
-		h2cHandler := h2c.NewHandler(router, &http2.Server{
+		server.Handler = h2c.NewHandler(router, &http2.Server{
 			MaxConcurrentStreams:         250,
 			IdleTimeout:                  300 * time.Second,
 			MaxReadFrameSize:             4 << 20,
 			MaxUploadBufferPerConnection: 8 << 20,
 			MaxUploadBufferPerStream:     2 << 20,
 		})
-		server.Handler = h2cHandler
 	} else {
 		server.Handler = router
 	}
 
-	err := server.ListenAndServe()
-	if err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		fmt.Printf("启动服务失败: %v\n", err)
 	}
 }
 
-// 简单的健康检查
 func formatDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%d秒", int(d.Seconds()))
-	} else if d < time.Hour {
-		return fmt.Sprintf("%d分钟%d秒", int(d.Minutes()), int(d.Seconds())%60)
-	} else if d < 24*time.Hour {
-		return fmt.Sprintf("%d小时%d分钟", int(d.Hours()), int(d.Minutes())%60)
-	} else {
-		days := int(d.Hours()) / 24
-		hours := int(d.Hours()) % 24
-		return fmt.Sprintf("%d天%d小时", days, hours)
 	}
+	if d < time.Hour {
+		return fmt.Sprintf("%d分钟%d秒", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%d小时%d分钟", int(d.Hours()), int(d.Minutes())%60)
+	}
+
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	return fmt.Sprintf("%d天%d小时", days, hours)
 }
 
 func getUptimeInfo() (time.Duration, float64, string) {
